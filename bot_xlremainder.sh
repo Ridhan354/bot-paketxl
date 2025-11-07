@@ -94,7 +94,18 @@ install_dependencies() {
   install -d -m 755 "$INSTALL_DIR/backups"
 
   echo "Menyalin berkas aplikasi"
-  install -m 644 "$REQUIREMENTS_SRC" "$INSTALL_DIR/requirements.txt"
+  if [ -f "$REQUIREMENTS_SRC" ]; then
+    install -m 644 "$REQUIREMENTS_SRC" "$INSTALL_DIR/requirements.txt"
+  else
+    cat >"$INSTALL_DIR/requirements.txt" <<'EOF_REQ'
+python-telegram-bot>=20.6,<21
+python-dotenv>=1.0
+requests>=2.31
+apscheduler>=3.10
+pytz>=2023.3
+EOF_REQ
+    echo "requirements.txt tidak ditemukan di sumber, menggunakan daftar dependensi bawaan."
+  fi
   install -m 755 "$BOT_SRC" "$INSTALL_DIR/xl_bot.py"
   install -m 644 "$README_SRC" "$INSTALL_DIR/README.md"
 
