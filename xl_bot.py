@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, time, json, sqlite3, logging, requests, html, io, gzip, shutil, asyncio
+import os, re, time, json, sqlite3, logging, requests, html, io, gzip, shutil, asyncio, subprocess, sys
 from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
 
@@ -34,6 +34,12 @@ ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS", ""))}
 BACKUP_DIR = os.getenv("BACKUP_DIR", "./backups")
 WEEKLY_BACKUP_DAY = os.getenv("WEEKLY_BACKUP_DAY", "sun")  # mon..sun
 WEEKLY_BACKUP_HOUR = int(os.getenv("WEEKLY_BACKUP_HOUR", "2"))
+REPO_URL = os.getenv("REPO_URL", "https://github.com/Ridhan354/bot-paketxl.git")
+REPO_BRANCH = os.getenv("REPO_BRANCH", "main")
+INSTALL_BASE = Path(os.getenv("INSTALL_BASE", str(Path(__file__).resolve().parent.parent)))
+APP_DIR = Path(__file__).resolve().parent
+VENV_PATH = Path(os.getenv("VENV_PATH", str(INSTALL_BASE / ".venv")))
+GIT_BIN = os.getenv("GIT_BIN", "git")
 
 TZ = pytz.timezone("Asia/Jakarta")
 
@@ -551,6 +557,9 @@ def main_menu_keyboard(has_numbers: bool, sort_order: str = "asc", has_search: b
             InlineKeyboardButton("🗄 Backup", callback_data="menu_backup_now"),
             InlineKeyboardButton("♻️ Restore", callback_data="menu_restore"),
         ])
+        rows.append([
+            InlineKeyboardButton("🔁 Update Bot", callback_data="menu_update"),
+        ])
     rows.append([InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu_settings")])
     rows.append([InlineKeyboardButton("ℹ️ Bantuan", callback_data="menu_help")])
     return InlineKeyboardMarkup(rows)
@@ -575,6 +584,114 @@ def numbers_keyboard(rows: List[sqlite3.Row], action_prefix: str, with_refresh: 
 # Tombol salin (prefill kolom chat)
 def copy_button(msisdn: str) -> InlineKeyboardButton:
     return InlineKeyboardButton("📋 Salin nomor", switch_inline_query_current_chat=msisdn)
+
+
+# =========================
+# UPDATE (ADMIN)
+# =========================
+def git_available() -> bool:
+    return shutil.which(GIT_BIN) is not None
+
+
+def current_commit() -> str:
+    if not git_available():
+        return "git tidak tersedia"
+    try:
+        res = subprocess.run([GIT_BIN, "rev-parse", "--short", "HEAD"], cwd=APP_DIR,
+                              capture_output=True, text=True, check=True)
+        return res.stdout.strip() or "(tidak diketahui)"
+    except Exception as exc:
+        logging.warning(f"Gagal membaca commit saat ini: {exc}")
+        return "(gagal membaca)"
+
+
+async def run_command(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd) if cwd else None,
+                                                stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.PIPE)
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout.decode(), stderr.decode()
+
+
+async def menu_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Hanya admin.", show_alert=True)
+        return
+
+    repo_info = (
+        f"🔁 <b>Update Bot</b>\n\n"
+        f"Repo: <code>{html.escape(REPO_URL)}</code>\n"
+        f"Branch: <code>{html.escape(REPO_BRANCH)}</code>\n"
+        f"Commit saat ini: <code>{html.escape(current_commit())}</code>\n\n"
+        "Tekan tombol di bawah untuk menarik pembaruan terbaru dari GitHub."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Tarik Pembaruan", callback_data="menu_update_run")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_overview")],
+    ])
+    await q.answer()
+    await q.edit_message_text(repo_info, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def menu_update_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Hanya admin.", show_alert=True)
+        return
+
+    if not git_available():
+        await q.answer("git tidak tersedia", show_alert=True)
+        return
+
+    await q.edit_message_text("🔁 Menjalankan update dari GitHub…", parse_mode=ParseMode.HTML)
+
+    logs: List[str] = []
+    success = True
+    commands: List[Tuple[str, List[str], Optional[Path]]] = [
+        ("Fetch", [GIT_BIN, "fetch", "--all", "--prune"], APP_DIR),
+        ("Reset", [GIT_BIN, "reset", "--hard", f"origin/{REPO_BRANCH}"], APP_DIR),
+    ]
+
+    requirements_path = APP_DIR / "requirements.txt"
+    python_exec = VENV_PATH / "bin" / "python"
+    if not python_exec.exists():
+        python_exec = Path(sys.executable)
+    commands.append((
+        "Install deps",
+        [str(python_exec), "-m", "pip", "install", "-r", str(requirements_path)],
+        APP_DIR,
+    ))
+
+    for label, cmd, cwd in commands:
+        logs.append(f"$ {' '.join(cmd)}")
+        code, out, err = await run_command(cmd, cwd)
+        if out:
+            logs.append(out.strip())
+        if err:
+            logs.append(err.strip())
+        if code != 0:
+            logs.append(f"❌ {label} gagal dengan kode {code}")
+            success = False
+            break
+        logs.append(f"✅ {label} selesai")
+
+    new_commit = current_commit()
+    status = "✅ Update selesai." if success else "⚠️ Update gagal."
+    summary = (
+        f"{status}\nCommit terbaru: <code>{html.escape(new_commit)}</code>\n"
+        "Silakan restart bot bila diperlukan."
+    )
+
+    full_log = "\n".join([line for line in logs if line]).strip()
+    if len(full_log) > 3500:
+        full_log = full_log[-3500:]
+
+    await q.edit_message_text(
+        f"{summary}\n\n<pre>{html.escape(full_log or '(tidak ada log)')}</pre>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="menu_overview")]])
+    )
 
 # =========================
 # OVERVIEW (paket + masa aktif kartu)
@@ -1395,6 +1512,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(quick_force_one,       pattern="^qforce:"))
 
     app.add_handler(CallbackQueryHandler(menu_ics,           pattern="^menu_ics$"))
+    app.add_handler(CallbackQueryHandler(menu_update,       pattern="^menu_update$"))
+    app.add_handler(CallbackQueryHandler(menu_update_run,   pattern="^menu_update_run$"))
     app.add_handler(CallbackQueryHandler(menu_settings,      pattern="^menu_settings$"))
     app.add_handler(CallbackQueryHandler(settings_toggle,    pattern="^settings_toggle:"))
     app.add_handler(CallbackQueryHandler(settings_hour,      pattern="^settings_hour$"))

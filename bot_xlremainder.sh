@@ -2,15 +2,15 @@
 set -euo pipefail
 
 INSTALL_DIR="/opt/bot-xlreminder"
+APP_DIR="$INSTALL_DIR/app"
 VENV_DIR="$INSTALL_DIR/.venv"
 SERVICE_NAME="bot-xlreminder"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="https://github.com/Ridhan354/bot-paketxl.git"
+REPO_BRANCH="main"
 PYTHON_BIN="${PYTHON:-python3}"
+GIT_BIN="${GIT:-git}"
 ENV_FILE="$INSTALL_DIR/.env"
-REQUIREMENTS_SRC="$REPO_DIR/requirements.txt"
-BOT_SRC="$REPO_DIR/xl_bot.py"
-README_SRC="$REPO_DIR/README.md"
 
 require_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -22,6 +22,13 @@ require_root() {
 need_systemctl() {
   if ! command -v systemctl >/dev/null 2>&1; then
     echo "systemctl tidak ditemukan. Pastikan berjalan di sistem dengan systemd." >&2
+    exit 1
+  fi
+}
+
+require_git() {
+  if ! command -v "$GIT_BIN" >/dev/null 2>&1; then
+    echo "git tidak ditemukan. Pasang git terlebih dahulu." >&2
     exit 1
   fi
 }
@@ -43,6 +50,20 @@ update_env_var() {
     sed -i "s|^$key=.*|$key=$escaped|" "$file"
   else
     printf '%s=%s\n' "$key" "$value" >>"$file"
+  fi
+}
+
+sync_repository() {
+  require_git
+  install -d -m 755 "$INSTALL_DIR"
+  if [ -d "$APP_DIR/.git" ]; then
+    echo "Memperbarui repositori di $APP_DIR"
+    "$GIT_BIN" -C "$APP_DIR" fetch --all --prune
+    "$GIT_BIN" -C "$APP_DIR" reset --hard "origin/$REPO_BRANCH"
+  else
+    echo "Mengunduh repositori dari $REPO_URL (branch $REPO_BRANCH)"
+    rm -rf "$APP_DIR"
+    "$GIT_BIN" clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" "$APP_DIR"
   fi
 }
 
@@ -84,30 +105,26 @@ ADMIN_IDS=$admin_ids
 BACKUP_DIR=$default_backup
 WEEKLY_BACKUP_DAY=sun
 WEEKLY_BACKUP_HOUR=2
+INSTALL_BASE=$INSTALL_DIR
+REPO_URL=$REPO_URL
+REPO_BRANCH=$REPO_BRANCH
+VENV_PATH=$VENV_DIR
 EOF_ENV
   echo "Berkas .env dibuat di $ENV_FILE"
 }
 
-install_dependencies() {
-  echo "Membuat direktori instalasi di $INSTALL_DIR"
-  install -d -m 755 "$INSTALL_DIR"
-  install -d -m 755 "$INSTALL_DIR/backups"
+ensure_env_defaults() {
+  update_env_var "INSTALL_BASE" "$INSTALL_DIR" "$ENV_FILE"
+  update_env_var "REPO_URL" "$REPO_URL" "$ENV_FILE"
+  update_env_var "REPO_BRANCH" "$REPO_BRANCH" "$ENV_FILE"
+  update_env_var "VENV_PATH" "$VENV_DIR" "$ENV_FILE"
+}
 
-  echo "Menyalin berkas aplikasi"
-  if [ -f "$REQUIREMENTS_SRC" ]; then
-    install -m 644 "$REQUIREMENTS_SRC" "$INSTALL_DIR/requirements.txt"
-  else
-    cat >"$INSTALL_DIR/requirements.txt" <<'EOF_REQ'
-python-telegram-bot>=20.6,<21
-python-dotenv>=1.0
-requests>=2.31
-apscheduler>=3.10
-pytz>=2023.3
-EOF_REQ
-    echo "requirements.txt tidak ditemukan di sumber, menggunakan daftar dependensi bawaan."
-  fi
-  install -m 755 "$BOT_SRC" "$INSTALL_DIR/xl_bot.py"
-  install -m 644 "$README_SRC" "$INSTALL_DIR/README.md"
+install_dependencies() {
+  echo "Sinkronisasi kode dari GitHub"
+  sync_repository
+
+  install -d -m 755 "$INSTALL_DIR/backups"
 
   if [ ! -d "$VENV_DIR" ]; then
     echo "Membuat virtual environment"
@@ -116,9 +133,21 @@ EOF_REQ
     echo "Virtual environment sudah ada"
   fi
 
+  local requirements_file="$APP_DIR/requirements.txt"
+  if [ ! -f "$requirements_file" ]; then
+    cat >"$requirements_file" <<'EOF_REQ'
+python-telegram-bot>=20.6,<21
+python-dotenv>=1.0
+requests>=2.31
+apscheduler>=3.10
+pytz>=2023.3
+EOF_REQ
+    echo "requirements.txt dari repo tidak ditemukan, menggunakan daftar bawaan."
+  fi
+
   echo "Memperbarui pip dan memasang dependensi"
   "$VENV_DIR/bin/pip" install --upgrade pip
-  "$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
+  "$VENV_DIR/bin/pip" install -r "$requirements_file"
 
   touch "$INSTALL_DIR/xl_reminder.db"
   echo "Database disiapkan di $INSTALL_DIR/xl_reminder.db"
@@ -133,9 +162,9 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$INSTALL_DIR
+WorkingDirectory=$APP_DIR
 EnvironmentFile=$ENV_FILE
-ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/xl_bot.py
+ExecStart=$VENV_DIR/bin/python $APP_DIR/xl_bot.py
 Restart=on-failure
 User=root
 Group=root
@@ -152,6 +181,7 @@ install_bot() {
   require_root
   install_dependencies
   create_env_file
+  ensure_env_defaults
   create_service
   echo "Instalasi selesai. Gunakan menu Start untuk menjalankan bot."
 }
