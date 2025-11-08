@@ -758,13 +758,24 @@ def build_overview_text(tg_user_id: int) -> str:
                 pkg_emo, _, pkg_days = indicator_by_date(expiry)
                 age_min = int((now - (last_ts or now)) / 60)
                 eta = f"{pkg_days} hari lagi" if (pkg_days is not None and pkg_days >= 0) else "lewat jatuh tempo"
-                lines.append(
-                    f"\n👤 <b>{html.escape(label)}</b>\n"
-                    f"📱 <code>{html.escape(msisdn)}</code>\n"
-                    f"💳 {card_emo} Kartu aktif s.d. <b>{html.escape(exp_card)}</b>  •  {card_eta}\n"
-                    f"📦 {pkg_emo} <b>{html.escape(abbr)}</b>  •  ⏳ <b>{html.escape(expiry)}</b>  •  {eta}\n"
-                    f"🕘 Cache: {age_min} menit lalu"
-                )
+
+                packages = ((data.get("package_info") or {}).get("packages") or [])
+                pkg_lines = reminder_package_lines(packages) if packages else []
+
+                section_lines = [
+                    "",
+                    f"👤 <b>{html.escape(label)}</b>",
+                    f"📱 <code>{html.escape(msisdn)}</code>",
+                    f"💳 {card_emo} Kartu aktif s.d. <b>{html.escape(exp_card)}</b>  •  {card_eta}",
+                    f"📦 {pkg_emo} <b>{html.escape(abbr)}</b>  •  ⏳ <b>{html.escape(expiry)}</b>  •  {eta}",
+                ]
+
+                if pkg_lines:
+                    section_lines.append("📦 Daftar paket aktif:")
+                    section_lines.extend(pkg_lines)
+
+                section_lines.append(f"🕘 Cache: {age_min} menit lalu")
+                lines.extend(section_lines)
         elif last_error:
             wait = max(0, next_retry - now)
             wait_min = int(wait/60)
