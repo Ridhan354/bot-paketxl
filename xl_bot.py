@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, time, json, sqlite3, logging, requests, html, io, gzip, shutil, asyncio
+import os, re, time, json, sqlite3, logging, requests, html, io, gzip, shutil, asyncio, subprocess, sys
 from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
 
@@ -34,8 +34,15 @@ ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS", ""))}
 BACKUP_DIR = os.getenv("BACKUP_DIR", "./backups")
 WEEKLY_BACKUP_DAY = os.getenv("WEEKLY_BACKUP_DAY", "sun")  # mon..sun
 WEEKLY_BACKUP_HOUR = int(os.getenv("WEEKLY_BACKUP_HOUR", "2"))
+REPO_URL = os.getenv("REPO_URL", "https://github.com/Ridhan354/bot-paketxl.git")
+REPO_BRANCH = os.getenv("REPO_BRANCH", "main")
+INSTALL_BASE = Path(os.getenv("INSTALL_BASE", str(Path(__file__).resolve().parent.parent)))
+APP_DIR = Path(__file__).resolve().parent
+VENV_PATH = Path(os.getenv("VENV_PATH", str(INSTALL_BASE / ".venv")))
+GIT_BIN = os.getenv("GIT_BIN", "git")
 
 TZ = pytz.timezone("Asia/Jakarta")
+CHUNK_SIZE = 3800
 
 logging.basicConfig(
     level=logging.INFO,
@@ -132,6 +139,7 @@ def db_init():
             next_retry_ts INTEGER DEFAULT 0,
             last_error TEXT,
             last_notified_expiry TEXT,
+            last_notified_type TEXT,
             last_notified_at INTEGER DEFAULT 0
         )""")
         con.commit()
@@ -141,22 +149,73 @@ def db_init():
         _add_column_if_missing(con, "numbers", "next_retry_ts", "next_retry_ts INTEGER DEFAULT 0")
         _add_column_if_missing(con, "numbers", "last_error",    "last_error TEXT")
         _add_column_if_missing(con, "numbers", "last_notified_expiry", "last_notified_expiry TEXT")
+        _add_column_if_missing(con, "numbers", "last_notified_type", "last_notified_type TEXT")
         _add_column_if_missing(con, "numbers", "last_notified_at",     "last_notified_at INTEGER DEFAULT 0")
 
     # USER_PREFS: sort & search
     if not _table_exists(con, "user_prefs"):
-        cur.execute("""
+        cur.execute(f"""
         CREATE TABLE user_prefs (
             tg_user_id INTEGER PRIMARY KEY,
             sort_order TEXT NOT NULL DEFAULT 'asc', -- 'asc'/'desc'
-            search_query TEXT DEFAULT ''
+            search_query TEXT DEFAULT '',
+            reminder_h1 INTEGER NOT NULL DEFAULT 1,
+            reminder_h0 INTEGER NOT NULL DEFAULT 1,
+            reminder_hour INTEGER NOT NULL DEFAULT {REMINDER_HOUR}
         )""")
         con.commit()
     else:
         _add_column_if_missing(con, "user_prefs", "sort_order",   "sort_order TEXT NOT NULL DEFAULT 'asc'")
         _add_column_if_missing(con, "user_prefs", "search_query", "search_query TEXT DEFAULT ''")
+        _add_column_if_missing(con, "user_prefs", "reminder_h1",  "reminder_h1 INTEGER NOT NULL DEFAULT 1")
+        _add_column_if_missing(con, "user_prefs", "reminder_h0",  "reminder_h0 INTEGER NOT NULL DEFAULT 1")
+        _add_column_if_missing(con, "user_prefs", "reminder_hour", f"reminder_hour INTEGER NOT NULL DEFAULT {REMINDER_HOUR}")
 
     con.close()
+
+# =========================
+# TELEGRAM HELPERS
+# =========================
+def chunk_text(text: str, limit: int = CHUNK_SIZE) -> List[str]:
+    if not text:
+        return []
+    chunks: List[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1 or split_at < limit * 0.6:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+async def message_reply_chunks(message, text: str, reply_markup=None):
+    chunks = chunk_text(text)
+    if not chunks:
+        return
+    first = True
+    for chunk in chunks:
+        if first:
+            await message.reply_text(chunk, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            first = False
+        else:
+            await message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+
+async def query_edit_or_reply_chunks(query, text: str, reply_markup=None):
+    chunks = chunk_text(text)
+    if not chunks:
+        await query.edit_message_text("", parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        return
+    await query.edit_message_text(chunks[0], parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    message = query.message
+    if message is None:
+        return
+    for chunk in chunks[1:]:
+        await message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 # Prefs helpers
 def get_prefs(tg_user_id: int) -> Tuple[str, str]:
@@ -190,6 +249,47 @@ def clear_search_query(tg_user_id: int):
     cur.execute("UPDATE user_prefs SET search_query='' WHERE tg_user_id=?", (tg_user_id,))
     con.commit(); con.close()
 
+def get_reminder_settings(tg_user_id: int) -> Tuple[bool, bool, int]:
+    # Pastikan baris pref tersedia
+    get_prefs(tg_user_id)
+    con = _db_conn(); cur = con.cursor()
+    cur.execute("SELECT reminder_h1, reminder_h0, reminder_hour FROM user_prefs WHERE tg_user_id=?", (tg_user_id,))
+    row = cur.fetchone(); con.close()
+    if not row:
+        return True, True, REMINDER_HOUR
+    h1 = bool(row["reminder_h1"] if row["reminder_h1"] is not None else 1)
+    h0 = bool(row["reminder_h0"] if row["reminder_h0"] is not None else 1)
+    hour = row["reminder_hour"] if row["reminder_hour"] is not None else REMINDER_HOUR
+    try:
+        hour = int(hour)
+    except Exception:
+        hour = REMINDER_HOUR
+    hour = max(0, min(23, hour))
+    return h1, h0, hour
+
+def set_reminder_flag(tg_user_id: int, column: str, value: bool):
+    if column not in {"reminder_h1", "reminder_h0"}:
+        raise ValueError("Invalid reminder flag")
+    get_prefs(tg_user_id)
+    con = _db_conn(); cur = con.cursor()
+    cur.execute(f"UPDATE user_prefs SET {column}=? WHERE tg_user_id=?", (1 if value else 0, tg_user_id))
+    con.commit(); con.close()
+
+def toggle_reminder_flag(tg_user_id: int, column: str) -> bool:
+    h1, h0, _ = get_reminder_settings(tg_user_id)
+    current = {"reminder_h1": h1, "reminder_h0": h0}[column]
+    new_val = not current
+    set_reminder_flag(tg_user_id, column, new_val)
+    return new_val
+
+def set_reminder_hour(tg_user_id: int, hour: int):
+    hour = int(hour)
+    hour = max(0, min(23, hour))
+    get_prefs(tg_user_id)
+    con = _db_conn(); cur = con.cursor()
+    cur.execute("UPDATE user_prefs SET reminder_hour=? WHERE tg_user_id=?", (hour, tg_user_id))
+    con.commit(); con.close()
+
 # Numbers & users helpers
 def ensure_user(tg_user) -> None:
     con = _db_conn(); cur = con.cursor()
@@ -205,10 +305,10 @@ def add_number(tg_user_id: int, label: str, msisdn: str) -> Tuple[bool, str]:
     con = _db_conn(); cur = con.cursor()
     try:
         cur.execute("""
-        INSERT INTO numbers (tg_user_id, label, msisdn, is_default, created_at, 
+        INSERT INTO numbers (tg_user_id, label, msisdn, is_default, created_at,
                              last_fetch_ts, last_payload, next_retry_ts, last_error,
-                             last_notified_expiry, last_notified_at)
-        VALUES (?, ?, ?, 0, ?, 0, NULL, 0, NULL, NULL, 0)
+                             last_notified_expiry, last_notified_type, last_notified_at)
+        VALUES (?, ?, ?, 0, ?, 0, NULL, 0, NULL, NULL, NULL, 0)
         """, (tg_user_id, label, msisdn, int(time.time())))
         con.commit()
         return True, "Nomor berhasil didaftarkan."
@@ -248,24 +348,24 @@ def update_cache(msisdn: str, payload: Optional[Dict[str, Any]], error: Optional
     """, (now, json.dumps(payload) if payload is not None else None, error, next_retry, msisdn))
     con.commit(); con.close()
 
-def get_cached(msisdn: str) -> Tuple[int, Optional[Dict[str, Any]], Optional[str], int, Optional[str], int]:
+def get_cached(msisdn: str) -> Tuple[int, Optional[Dict[str, Any]], Optional[str], int, Optional[str], Optional[str], int]:
     con = _db_conn(); cur = con.cursor()
-    cur.execute("""SELECT last_fetch_ts, last_payload, last_error, next_retry_ts, 
-                          last_notified_expiry, last_notified_at
+    cur.execute("""SELECT last_fetch_ts, last_payload, last_error, next_retry_ts,
+                          last_notified_expiry, last_notified_type, last_notified_at
                    FROM numbers WHERE msisdn=?""", (msisdn,))
     r = cur.fetchone(); con.close()
     if not r:
-        return 0, None, None, 0, None, 0
+        return 0, None, None, 0, None, None, 0
     payload = json.loads(r["last_payload"]) if r["last_payload"] else None
     return (r["last_fetch_ts"] or 0, payload, r["last_error"], r["next_retry_ts"] or 0,
-            r["last_notified_expiry"], r["last_notified_at"] or 0)
+            r["last_notified_expiry"], r["last_notified_type"], r["last_notified_at"] or 0)
 
-def set_last_notified(msisdn: str, expiry_text: str):
+def set_last_notified(msisdn: str, expiry_text: str, notif_type: str):
     con = _db_conn(); cur = con.cursor()
     cur.execute("""
-        UPDATE numbers SET last_notified_expiry=?, last_notified_at=?
+        UPDATE numbers SET last_notified_expiry=?, last_notified_type=?, last_notified_at=?
         WHERE msisdn=?
-    """, (expiry_text, int(time.time()), msisdn))
+    """, (expiry_text, notif_type, int(time.time()), msisdn))
     con.commit(); con.close()
 
 # =========================
@@ -378,24 +478,55 @@ def build_message(data: Dict[str, Any]) -> str:
         if not packages:
             lines.append("⚠️ Tidak ada paket terdaftar.")
         else:
-            lines.append(format_package(packages[0]))
-            lines.append("")
+            if len(packages) > 1:
+                lines.append(f"📦 <b>{len(packages)} paket aktif ditemukan:</b>")
+            multi = len(packages) > 1
+            for idx, pkg in enumerate(packages, start=1):
+                lines.append(format_package(pkg, idx if multi else None))
+                lines.append("")
+            if lines and lines[-1] == "":
+                lines.pop()
 
     lines.append(f"🔔 Dilaporkan: <i>{time.strftime('%Y-%m-%d %H:%M:%S')}</i>")
     return "\n".join(lines)
 
-def format_package(pkg: Dict[str, Any]) -> str:
+def format_package(pkg: Dict[str, Any], index: Optional[int] = None) -> str:
     name = pkg.get("name", "Unknown Package")
     expiry = pkg.get("expiry", "-")
-    lines = [f"📦 <b>{html.escape(name)}</b>", f"⏳ Kedaluwarsa: <b>{html.escape(expiry)}</b>"]
+    prefix = f"{index}. " if index is not None else ""
+    header = f"{prefix}<b>{html.escape(name)}</b>"
+    lines = [f"📦 {header}", f"⏳ Kedaluwarsa: <b>{html.escape(expiry)}</b>"]
     for q in (pkg.get("quotas") or []):
         qname = q.get("name", "-")
         bar = progress_bar(q.get("percent"))
         total = nice_size(q.get("total"))
         remaining = nice_size(q.get("remaining"))
-        lines.append(f"🔸 <b>{html.escape(qname)}</b>")
-        lines.append(f"    {bar} — sisa: <b>{html.escape(remaining)}</b> / {html.escape(total)}")
+        indent = "&nbsp;" * (6 if index is not None else 2)
+        lines.append(f"{indent}🔸 <b>{html.escape(qname)}</b>")
+        lines.append(f"{indent}&nbsp;&nbsp;{bar} — sisa: <b>{html.escape(remaining)}</b> / {html.escape(total)}")
     return "\n".join(lines)
+
+def reminder_package_lines(packages: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    multi = len(packages) > 1
+    for idx, pkg in enumerate(packages, start=1):
+        name = (pkg.get("name") or "").strip() or "-"
+        expiry = pkg.get("expiry", "-") or "-"
+        abbr = abbreviate_package(name)
+        prefix = f"{idx}. " if multi else "• "
+        lines.append(f"{prefix}<b>{html.escape(abbr)}</b> — {html.escape(expiry)}")
+        if name and name.upper() != abbr.upper():
+            lines.append(f"&nbsp;&nbsp;{html.escape(name)}")
+        quotas = pkg.get("quotas") or []
+        if quotas:
+            q0 = quotas[0]
+            qname = q0.get("name", "-")
+            remaining = nice_size(q0.get("remaining"))
+            total = nice_size(q0.get("total"))
+            lines.append(
+                f"&nbsp;&nbsp;Sisa utama: <b>{html.escape(remaining)}</b> / {html.escape(total)} ({html.escape(qname)})"
+            )
+    return lines
 
 # ===== API & CACHE POLICY =====
 LIMIT_PHRASE = "batas maksimal pengecekan"
@@ -432,7 +563,7 @@ def fetch_and_cache(msisdn: str) -> Tuple[bool, str]:
         return False, f"⚠️ {err}"
 
 def render_from_cache(msisdn: str) -> Optional[str]:
-    last_ts, payload, last_error, _, _, _ = get_cached(msisdn)
+    last_ts, payload, last_error, _, _, _, _ = get_cached(msisdn)
     if payload:
         return build_message(payload.get("data") or {})
     if last_error:
@@ -471,6 +602,10 @@ def main_menu_keyboard(has_numbers: bool, sort_order: str = "asc", has_search: b
             InlineKeyboardButton("🗄 Backup", callback_data="menu_backup_now"),
             InlineKeyboardButton("♻️ Restore", callback_data="menu_restore"),
         ])
+        rows.append([
+            InlineKeyboardButton("🔁 Update Bot", callback_data="menu_update"),
+        ])
+    rows.append([InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu_settings")])
     rows.append([InlineKeyboardButton("ℹ️ Bantuan", callback_data="menu_help")])
     return InlineKeyboardMarkup(rows)
 
@@ -495,6 +630,114 @@ def numbers_keyboard(rows: List[sqlite3.Row], action_prefix: str, with_refresh: 
 def copy_button(msisdn: str) -> InlineKeyboardButton:
     return InlineKeyboardButton("📋 Salin nomor", switch_inline_query_current_chat=msisdn)
 
+
+# =========================
+# UPDATE (ADMIN)
+# =========================
+def git_available() -> bool:
+    return shutil.which(GIT_BIN) is not None
+
+
+def current_commit() -> str:
+    if not git_available():
+        return "git tidak tersedia"
+    try:
+        res = subprocess.run([GIT_BIN, "rev-parse", "--short", "HEAD"], cwd=APP_DIR,
+                              capture_output=True, text=True, check=True)
+        return res.stdout.strip() or "(tidak diketahui)"
+    except Exception as exc:
+        logging.warning(f"Gagal membaca commit saat ini: {exc}")
+        return "(gagal membaca)"
+
+
+async def run_command(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd) if cwd else None,
+                                                stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.PIPE)
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout.decode(), stderr.decode()
+
+
+async def menu_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Hanya admin.", show_alert=True)
+        return
+
+    repo_info = (
+        f"🔁 <b>Update Bot</b>\n\n"
+        f"Repo: <code>{html.escape(REPO_URL)}</code>\n"
+        f"Branch: <code>{html.escape(REPO_BRANCH)}</code>\n"
+        f"Commit saat ini: <code>{html.escape(current_commit())}</code>\n\n"
+        "Tekan tombol di bawah untuk menarik pembaruan terbaru dari GitHub."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Tarik Pembaruan", callback_data="menu_update_run")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_overview")],
+    ])
+    await q.answer()
+    await q.edit_message_text(repo_info, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def menu_update_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Hanya admin.", show_alert=True)
+        return
+
+    if not git_available():
+        await q.answer("git tidak tersedia", show_alert=True)
+        return
+
+    await q.edit_message_text("🔁 Menjalankan update dari GitHub…", parse_mode=ParseMode.HTML)
+
+    logs: List[str] = []
+    success = True
+    commands: List[Tuple[str, List[str], Optional[Path]]] = [
+        ("Fetch", [GIT_BIN, "fetch", "--all", "--prune"], APP_DIR),
+        ("Reset", [GIT_BIN, "reset", "--hard", f"origin/{REPO_BRANCH}"], APP_DIR),
+    ]
+
+    requirements_path = APP_DIR / "requirements.txt"
+    python_exec = VENV_PATH / "bin" / "python"
+    if not python_exec.exists():
+        python_exec = Path(sys.executable)
+    commands.append((
+        "Install deps",
+        [str(python_exec), "-m", "pip", "install", "-r", str(requirements_path)],
+        APP_DIR,
+    ))
+
+    for label, cmd, cwd in commands:
+        logs.append(f"$ {' '.join(cmd)}")
+        code, out, err = await run_command(cmd, cwd)
+        if out:
+            logs.append(out.strip())
+        if err:
+            logs.append(err.strip())
+        if code != 0:
+            logs.append(f"❌ {label} gagal dengan kode {code}")
+            success = False
+            break
+        logs.append(f"✅ {label} selesai")
+
+    new_commit = current_commit()
+    status = "✅ Update selesai." if success else "⚠️ Update gagal."
+    summary = (
+        f"{status}\nCommit terbaru: <code>{html.escape(new_commit)}</code>\n"
+        "Silakan restart bot bila diperlukan."
+    )
+
+    full_log = "\n".join([line for line in logs if line]).strip()
+    if len(full_log) > 3500:
+        full_log = full_log[-3500:]
+
+    await q.edit_message_text(
+        f"{summary}\n\n<pre>{html.escape(full_log or '(tidak ada log)')}</pre>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="menu_overview")]])
+    )
+
 # =========================
 # OVERVIEW (paket + masa aktif kartu)
 # =========================
@@ -511,7 +754,7 @@ def build_overview_text(tg_user_id: int) -> str:
     for r in rows:
         label = r["label"] or "Customer"
         msisdn = r["msisdn"]
-        last_ts, payload, last_error, next_retry, _, _ = get_cached(msisdn)
+        last_ts, payload, last_error, next_retry, _, _, _ = get_cached(msisdn)
 
         if search_query:
             if (search_query.lower() not in (label.lower())) and (search_query not in msisdn):
@@ -560,13 +803,24 @@ def build_overview_text(tg_user_id: int) -> str:
                 pkg_emo, _, pkg_days = indicator_by_date(expiry)
                 age_min = int((now - (last_ts or now)) / 60)
                 eta = f"{pkg_days} hari lagi" if (pkg_days is not None and pkg_days >= 0) else "lewat jatuh tempo"
-                lines.append(
-                    f"\n👤 <b>{html.escape(label)}</b>\n"
-                    f"📱 <code>{html.escape(msisdn)}</code>\n"
-                    f"💳 {card_emo} Kartu aktif s.d. <b>{html.escape(exp_card)}</b>  •  {card_eta}\n"
-                    f"📦 {pkg_emo} <b>{html.escape(abbr)}</b>  •  ⏳ <b>{html.escape(expiry)}</b>  •  {eta}\n"
-                    f"🕘 Cache: {age_min} menit lalu"
-                )
+
+                packages = ((data.get("package_info") or {}).get("packages") or [])
+                pkg_lines = reminder_package_lines(packages) if packages else []
+
+                section_lines = [
+                    "",
+                    f"👤 <b>{html.escape(label)}</b>",
+                    f"📱 <code>{html.escape(msisdn)}</code>",
+                    f"💳 {card_emo} Kartu aktif s.d. <b>{html.escape(exp_card)}</b>  •  {card_eta}",
+                    f"📦 {pkg_emo} <b>{html.escape(abbr)}</b>  •  ⏳ <b>{html.escape(expiry)}</b>  •  {eta}",
+                ]
+
+                if pkg_lines:
+                    section_lines.append("📦 Daftar paket aktif:")
+                    section_lines.extend(pkg_lines)
+
+                section_lines.append(f"🕘 Cache: {age_min} menit lalu")
+                lines.extend(section_lines)
         elif last_error:
             wait = max(0, next_retry - now)
             wait_min = int(wait/60)
@@ -595,17 +849,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_numbers(user.id)
     sort_order, search_query = get_prefs(user.id)
     overview = build_overview_text(user.id)
-    text = (
-        "👋 <b>Selamat datang di XL Reminder Bot</b>\n\n"
-        f"{overview}\n"
-        "— — —\n"
-        "Gunakan tombol di bawah ini 👇"
-    )
+    intro = "👋 <b>Selamat datang di XL Reminder Bot</b>\n\n"
+    outro = "\n— — —\nGunakan tombol di bawah ini 👇"
+    full_text = f"{intro}{overview}{outro}"
     kb = main_menu_keyboard(bool(rows), sort_order, bool(search_query), user.id)
     if update.message:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await message_reply_chunks(update.message, full_text, reply_markup=kb)
     else:
-        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await query_edit_or_reply_chunks(update.callback_query, full_text, reply_markup=kb)
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -620,8 +871,11 @@ async def menu_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sort_order, search_query = get_prefs(q.from_user.id)
     await q.edit_message_text("⏳ Membuat overview…")
     overview = build_overview_text(q.from_user.id)
-    await q.edit_message_text(overview, parse_mode=ParseMode.HTML,
-                              reply_markup=main_menu_keyboard(bool(rows), sort_order, bool(search_query), q.from_user.id))
+    await query_edit_or_reply_chunks(
+        q,
+        overview,
+        reply_markup=main_menu_keyboard(bool(rows), sort_order, bool(search_query), q.from_user.id)
+    )
 
 # Sort toggle
 async def menu_sort_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -644,8 +898,11 @@ async def ask_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_numbers(update.effective_user.id)
     sort_order, search_query = get_prefs(update.effective_user.id)
     overview = build_overview_text(update.effective_user.id)
-    await update.message.reply_text(overview, parse_mode=ParseMode.HTML,
-                                    reply_markup=main_menu_keyboard(bool(rows), sort_order, bool(search_query), update.effective_user.id))
+    await message_reply_chunks(
+        update.message,
+        overview,
+        reply_markup=main_menu_keyboard(bool(rows), sort_order, bool(search_query), update.effective_user.id)
+    )
     return ConversationHandler.END
 
 async def menu_search_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -757,7 +1014,7 @@ async def check_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("♻️ Paksa semua", callback_data="chk_refresh_force_all")],
         [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_check")]
     ])
-    await q.edit_message_text(cached, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await query_edit_or_reply_chunks(q, cached, reply_markup=kb)
 
 async def check_refresh_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Merefresh yang sudah due…")
@@ -766,15 +1023,17 @@ async def check_refresh_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
     refreshed = 0
     for r in rows:
         msisdn = r["msisdn"]
-        last_ts, _, _, next_retry, _, _ = get_cached(msisdn)
+        last_ts, _, _, next_retry, _, _, _ = get_cached(msisdn)
         if now >= (next_retry or 0) and (now - (last_ts or 0)) >= REFRESH_INTERVAL_SECS:
             fetch_and_cache(msisdn)
             refreshed += 1
     sort_order, search_query = get_prefs(q.from_user.id)
     overview = build_overview_text(q.from_user.id)
-    await q.edit_message_text(f"🔄 Selesai. Diresfresh: {refreshed}/{len(rows)} nomor.\n\n{overview}",
-                              parse_mode=ParseMode.HTML,
-                              reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id))
+    await query_edit_or_reply_chunks(
+        q,
+        f"🔄 Selesai. Diresfresh: {refreshed}/{len(rows)} nomor.\n\n{overview}",
+        reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id)
+    )
 
 async def check_refresh_force_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Memaksa refresh semua…")
@@ -787,9 +1046,11 @@ async def check_refresh_force_all(update: Update, context: ContextTypes.DEFAULT_
         await asyncio.sleep(1.5)  # jeda ramah API
     sort_order, search_query = get_prefs(q.from_user.id)
     overview = build_overview_text(q.from_user.id)
-    await q.edit_message_text(f"♻️ Selesai (paksa global). Diresfresh: {refreshed}/{len(rows)} nomor.\n\n{overview}",
-                              parse_mode=ParseMode.HTML,
-                              reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id))
+    await query_edit_or_reply_chunks(
+        q,
+        f"♻️ Selesai (paksa global). Diresfresh: {refreshed}/{len(rows)} nomor.\n\n{overview}",
+        reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id)
+    )
 
 # QUICK DETAIL ============
 async def menu_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -803,7 +1064,7 @@ async def menu_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               reply_markup=numbers_keyboard(rows, "qdet"))
 
 def render_quick_detail(msisdn: str) -> str:
-    last_ts, payload, last_error, _, _, _ = get_cached(msisdn)
+    last_ts, payload, last_error, _, _, _, _ = get_cached(msisdn)
     if not payload:
         if last_error:
             return f"🚫 {html.escape(last_error)}"
@@ -872,7 +1133,7 @@ def build_ics_for_user(tg_user_id: int, days_ahead: int = 30) -> bytes:
     for r in rows:
         label = r["label"] or "Customer"
         msisdn = r["msisdn"]
-        _, payload, _, _, _, _ = get_cached(msisdn)
+        _, payload, _, _, _, _, _ = get_cached(msisdn)
         if not payload:
             continue
         data = payload.get("data") or {}
@@ -942,7 +1203,7 @@ async def menu_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Detail Cepat: paket + 3 kuota teratas, tombol ♻️ paksa & 📋 salin nomor.\n"
         "• Refresh: 🔄 due-only (aman) atau ♻️ paksa semua (abaikan interval & blokir lokal, jeda 1.5s).\n"
         "• Export ICS: event all-day, judul = Nama + Singkatan Paket, UID stabil.\n"
-        "• Reminder H-1: paket yang habis <i>besok</i>.\n"
+        "• Reminder H-1 & Hari-H: paket yang habis besok/hari ini (atur di Pengaturan).\n"
         "• Backup mingguan + restore (admin only). Tombol ada di menu utama.\n"
         "\n"
         "📌 <b>Indikator Paket</b>: 🟢 aman (>7 hari), 🟡 waspada (≤7 hari), 🔴 segera (≤3 hari), ⚪ unknown/error.\n"
@@ -953,6 +1214,66 @@ async def menu_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await q.edit_message_text(text, parse_mode=ParseMode.HTML,
                               reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id))
+
+async def render_settings_menu(query) -> None:
+    h1, h0, hour = get_reminder_settings(query.from_user.id)
+    status = lambda flag: "✅ Aktif" if flag else "❌ Nonaktif"
+    text = (
+        "⚙️ <b>Pengaturan Reminder</b>\n"
+        f"• Reminder H-1: {status(h1)}\n"
+        f"• Reminder Hari-H: {status(h0)}\n"
+        f"• Jam pengiriman (WIB): <b>{hour:02d}:00</b>\n"
+        "\n"
+        "Reminder dikirim sesuai cache terakhir. Pastikan auto-refresh berjalan atau lakukan refresh manual."
+    )
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(("✅ " if h1 else "❌ ") + "Toggle H-1", callback_data="settings_toggle:reminder_h1"),
+            InlineKeyboardButton(("✅ " if h0 else "❌ ") + "Toggle Hari-H", callback_data="settings_toggle:reminder_h0"),
+        ],
+        [InlineKeyboardButton("🕘 Ubah jam kirim", callback_data="settings_hour")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")],
+    ])
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+async def render_hour_picker(query) -> None:
+    buttons = []
+    row = []
+    for hour in range(24):
+        row.append(InlineKeyboardButton(f"{hour:02d}:00", callback_data=f"settings_hour_pick:{hour}"))
+        if len(row) == 6:
+            buttons.append(row); row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("⬅️ Batal", callback_data="menu_settings")])
+    await query.edit_message_text(
+        "🕘 <b>Pilih jam pengiriman (WIB)</b>\nReminder akan dikirim di jam terpilih jika ada paket yang memenuhi kriteria.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def menu_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await render_settings_menu(q)
+
+async def settings_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, column = q.data.split(":", 1)
+    await q.answer()
+    toggle_reminder_flag(q.from_user.id, column)
+    await render_settings_menu(q)
+
+async def settings_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await render_hour_picker(q)
+
+async def settings_hour_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, hour_str = q.data.split(":", 1)
+    hour = int(hour_str)
+    set_reminder_hour(q.from_user.id, hour)
+    await q.answer(f"Jam reminder diset ke {hour:02d}:00 WIB")
+    await render_settings_menu(q)
 
 # No-op & cancel
 async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -970,12 +1291,15 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # REMINDER JOB (H-1 paket)
 # =========================
 async def reminder_job(app: Application):
-    today_wib = datetime.now(TZ).date()
+    now_wib = datetime.now(TZ)
+    today_wib = now_wib.date()
     tomorrow_wib = today_wib + timedelta(days=1)
+    current_hour = now_wib.hour
 
     con = _db_conn(); cur = con.cursor()
     cur.execute("""
-        SELECT n.tg_user_id, n.label, n.msisdn, n.last_payload, n.last_notified_expiry
+        SELECT n.tg_user_id, n.label, n.msisdn, n.last_payload,
+               n.last_notified_expiry, n.last_notified_type, n.last_notified_at
         FROM numbers n
         ORDER BY n.tg_user_id, n.created_at ASC
     """)
@@ -986,7 +1310,12 @@ async def reminder_job(app: Application):
         label = r["label"] or "Customer"
         msisdn = r["msisdn"]
         last_payload_json = r["last_payload"]
-        last_notified_expiry = r["last_notified_expiry"]
+        last_notified_expiry = r["last_notified_expiry"] or ""
+        last_notified_type = (r["last_notified_type"] or "").upper()
+
+        h1_enabled, h0_enabled, pref_hour = get_reminder_settings(tg_user_id)
+        if current_hour != pref_hour:
+            continue
 
         if not last_payload_json:
             continue
@@ -997,29 +1326,55 @@ async def reminder_job(app: Application):
             continue
 
         data = payload.get("data") or {}
-        abbr, expiry_text, _ = extract_primary_package(data)
-        if abbr.startswith("ERROR:") or expiry_text in (None, "-", ""):
+        pk_info = data.get("package_info") or {}
+        packages = pk_info.get("packages") or []
+        if not packages:
             continue
 
-        d = parse_expiry_text(expiry_text)
-        if not d:
-            continue
-        if d == tomorrow_wib and last_notified_expiry != expiry_text:
+        due_h1 = []
+        due_h0 = []
+        for pkg in packages:
+            expiry_text = pkg.get("expiry")
+            if expiry_text in (None, "", "-"):
+                continue
+            d = parse_expiry_text(expiry_text)
+            if not d:
+                continue
+            if d == tomorrow_wib:
+                due_h1.append(pkg)
+            elif d == today_wib:
+                due_h0.append(pkg)
+
+        async def send_reminder(due_pkgs: List[Dict[str, Any]], notif_type: str, day_desc: str, suffix: str):
+            if not due_pkgs:
+                return
+            expiry_text = due_pkgs[0].get("expiry", "-")
+            if notif_type == last_notified_type and last_notified_expiry == expiry_text:
+                return
             emoji, _, _ = indicator_by_date(expiry_text)
-            msg = (
-                "🔔 <b>Pengingat Paket H-1</b>\n"
-                f"👤 <b>{html.escape(label)}</b>\n"
-                f"📱 <code>{html.escape(msisdn)}</code>\n"
-                f"📦 {emoji} <b>{html.escape(abbr)}</b>\n"
-                f"⏳ <b>Akan habis:</b> {html.escape(expiry_text)} (besok)\n\n"
-                "Tips: pertimbangkan isi ulang/aktifkan paket baru."
-            )
+            pkg_lines = reminder_package_lines(due_pkgs)
+            lines = [
+                f"🔔 <b>Pengingat Paket {day_desc}</b>",
+                f"👤 <b>{html.escape(label)}</b>",
+                f"📱 <code>{html.escape(msisdn)}</code>",
+                "",
+                f"{emoji} Paket yang {suffix}:",
+                *pkg_lines,
+                "",
+                "Pastikan pelanggan mendapatkan kuota baru atau lakukan pengecekan ulang setelah isi ulang."
+            ]
+            text = "\n".join(lines)
             try:
-                await app.bot.send_message(chat_id=tg_user_id, text=msg, parse_mode=ParseMode.HTML)
-                set_last_notified(msisdn, expiry_text)
-                logging.info(f"[Reminder] Sent H-1 for {msisdn} ({label}) exp {expiry_text}")
+                await app.bot.send_message(chat_id=tg_user_id, text=text, parse_mode=ParseMode.HTML)
+                set_last_notified(msisdn, expiry_text, notif_type)
+                logging.info(f"[Reminder] Sent {notif_type} for {msisdn} ({label}) exp {expiry_text}")
             except Exception as e:
                 logging.error(f"[Reminder] Failed to send to {tg_user_id}: {e}")
+
+        if h1_enabled:
+            await send_reminder(due_h1, "H-1", "H-1", "akan habis besok")
+        if h0_enabled:
+            await send_reminder(due_h0, "H", "Hari-H", "habis hari ini")
 
 # =========================
 # SCHEDULER TASKS
@@ -1220,6 +1575,12 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(quick_force_one,       pattern="^qforce:"))
 
     app.add_handler(CallbackQueryHandler(menu_ics,           pattern="^menu_ics$"))
+    app.add_handler(CallbackQueryHandler(menu_update,       pattern="^menu_update$"))
+    app.add_handler(CallbackQueryHandler(menu_update_run,   pattern="^menu_update_run$"))
+    app.add_handler(CallbackQueryHandler(menu_settings,      pattern="^menu_settings$"))
+    app.add_handler(CallbackQueryHandler(settings_toggle,    pattern="^settings_toggle:"))
+    app.add_handler(CallbackQueryHandler(settings_hour,      pattern="^settings_hour$"))
+    app.add_handler(CallbackQueryHandler(settings_hour_pick, pattern="^settings_hour_pick:"))
 
     # Backup: command & tombol
     app.add_handler(CommandHandler("backup_now", backup_now))
@@ -1236,16 +1597,16 @@ async def on_startup(app: Application):
     sched = AsyncIOScheduler(timezone=TZ)
     # scan refresh 30 menit
     sched.add_job(lambda: scheduled_refresh(app), "interval", minutes=30, id="refresh_scan")
-    # reminder H-1 harian
+    # reminder scan per jam (hormati jam preferensi tiap user)
     sched.add_job(lambda: reminder_job(app),
-                  CronTrigger(hour=REMINDER_HOUR, minute=0, timezone=TZ),
-                  id="reminder_h_minus_1")
+                  CronTrigger(minute=0, timezone=TZ),
+                  id="reminder_hourly")
     # backup mingguan
     sched.add_job(lambda: weekly_backup_job(app),
                   CronTrigger(day_of_week=WEEKLY_BACKUP_DAY, hour=WEEKLY_BACKUP_HOUR, minute=0, timezone=TZ),
                   id="weekly_backup")
     sched.start()
-    logging.info(f"Scheduler aktif: refresh 6 jam (scan 30m), reminder H-1 {REMINDER_HOUR:02d}:00 WIB, backup mingguan {WEEKLY_BACKUP_DAY} {WEEKLY_BACKUP_HOUR:02d}:00.")
+    logging.info(f"Scheduler aktif: refresh 6 jam (scan 30m), reminder per jam (default {REMINDER_HOUR:02d}:00 WIB), backup mingguan {WEEKLY_BACKUP_DAY} {WEEKLY_BACKUP_HOUR:02d}:00.")
 
 def main():
     if not BOT_TOKEN:
