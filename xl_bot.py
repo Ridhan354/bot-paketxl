@@ -42,6 +42,7 @@ VENV_PATH = Path(os.getenv("VENV_PATH", str(INSTALL_BASE / ".venv")))
 GIT_BIN = os.getenv("GIT_BIN", "git")
 
 TZ = pytz.timezone("Asia/Jakarta")
+CHUNK_SIZE = 3800
 
 logging.basicConfig(
     level=logging.INFO,
@@ -171,6 +172,50 @@ def db_init():
         _add_column_if_missing(con, "user_prefs", "reminder_hour", f"reminder_hour INTEGER NOT NULL DEFAULT {REMINDER_HOUR}")
 
     con.close()
+
+# =========================
+# TELEGRAM HELPERS
+# =========================
+def chunk_text(text: str, limit: int = CHUNK_SIZE) -> List[str]:
+    if not text:
+        return []
+    chunks: List[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1 or split_at < limit * 0.6:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+async def message_reply_chunks(message, text: str, reply_markup=None):
+    chunks = chunk_text(text)
+    if not chunks:
+        return
+    first = True
+    for chunk in chunks:
+        if first:
+            await message.reply_text(chunk, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            first = False
+        else:
+            await message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+
+async def query_edit_or_reply_chunks(query, text: str, reply_markup=None):
+    chunks = chunk_text(text)
+    if not chunks:
+        await query.edit_message_text("", parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        return
+    await query.edit_message_text(chunks[0], parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    message = query.message
+    if message is None:
+        return
+    for chunk in chunks[1:]:
+        await message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 # Prefs helpers
 def get_prefs(tg_user_id: int) -> Tuple[str, str]:
@@ -804,17 +849,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_numbers(user.id)
     sort_order, search_query = get_prefs(user.id)
     overview = build_overview_text(user.id)
-    text = (
-        "👋 <b>Selamat datang di XL Reminder Bot</b>\n\n"
-        f"{overview}\n"
-        "— — —\n"
-        "Gunakan tombol di bawah ini 👇"
-    )
+    intro = "👋 <b>Selamat datang di XL Reminder Bot</b>\n\n"
+    outro = "\n— — —\nGunakan tombol di bawah ini 👇"
+    full_text = f"{intro}{overview}{outro}"
     kb = main_menu_keyboard(bool(rows), sort_order, bool(search_query), user.id)
     if update.message:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await message_reply_chunks(update.message, full_text, reply_markup=kb)
     else:
-        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await query_edit_or_reply_chunks(update.callback_query, full_text, reply_markup=kb)
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -829,8 +871,11 @@ async def menu_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sort_order, search_query = get_prefs(q.from_user.id)
     await q.edit_message_text("⏳ Membuat overview…")
     overview = build_overview_text(q.from_user.id)
-    await q.edit_message_text(overview, parse_mode=ParseMode.HTML,
-                              reply_markup=main_menu_keyboard(bool(rows), sort_order, bool(search_query), q.from_user.id))
+    await query_edit_or_reply_chunks(
+        q,
+        overview,
+        reply_markup=main_menu_keyboard(bool(rows), sort_order, bool(search_query), q.from_user.id)
+    )
 
 # Sort toggle
 async def menu_sort_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -853,8 +898,11 @@ async def ask_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_numbers(update.effective_user.id)
     sort_order, search_query = get_prefs(update.effective_user.id)
     overview = build_overview_text(update.effective_user.id)
-    await update.message.reply_text(overview, parse_mode=ParseMode.HTML,
-                                    reply_markup=main_menu_keyboard(bool(rows), sort_order, bool(search_query), update.effective_user.id))
+    await message_reply_chunks(
+        update.message,
+        overview,
+        reply_markup=main_menu_keyboard(bool(rows), sort_order, bool(search_query), update.effective_user.id)
+    )
     return ConversationHandler.END
 
 async def menu_search_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -966,7 +1014,7 @@ async def check_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("♻️ Paksa semua", callback_data="chk_refresh_force_all")],
         [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_check")]
     ])
-    await q.edit_message_text(cached, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await query_edit_or_reply_chunks(q, cached, reply_markup=kb)
 
 async def check_refresh_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Merefresh yang sudah due…")
@@ -981,9 +1029,11 @@ async def check_refresh_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
             refreshed += 1
     sort_order, search_query = get_prefs(q.from_user.id)
     overview = build_overview_text(q.from_user.id)
-    await q.edit_message_text(f"🔄 Selesai. Diresfresh: {refreshed}/{len(rows)} nomor.\n\n{overview}",
-                              parse_mode=ParseMode.HTML,
-                              reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id))
+    await query_edit_or_reply_chunks(
+        q,
+        f"🔄 Selesai. Diresfresh: {refreshed}/{len(rows)} nomor.\n\n{overview}",
+        reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id)
+    )
 
 async def check_refresh_force_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Memaksa refresh semua…")
@@ -996,9 +1046,11 @@ async def check_refresh_force_all(update: Update, context: ContextTypes.DEFAULT_
         await asyncio.sleep(1.5)  # jeda ramah API
     sort_order, search_query = get_prefs(q.from_user.id)
     overview = build_overview_text(q.from_user.id)
-    await q.edit_message_text(f"♻️ Selesai (paksa global). Diresfresh: {refreshed}/{len(rows)} nomor.\n\n{overview}",
-                              parse_mode=ParseMode.HTML,
-                              reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id))
+    await query_edit_or_reply_chunks(
+        q,
+        f"♻️ Selesai (paksa global). Diresfresh: {refreshed}/{len(rows)} nomor.\n\n{overview}",
+        reply_markup=main_menu_keyboard(True, sort_order, bool(search_query), q.from_user.id)
+    )
 
 # QUICK DETAIL ============
 async def menu_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
