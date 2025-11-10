@@ -4,14 +4,30 @@ Bot Telegram untuk memantau paket data XL, masa aktif kartu, dan mengirimkan pen
 
 ## Fitur utama
 
-- Menyimpan banyak nomor XL dengan label berbeda di SQLite.
-- Menampilkan semua paket aktif beserta kuota dan masa berlaku lengkap.
-- Pengingat otomatis H-1 **dan** Hari-H yang dapat diaktif/nonaktifkan per pengguna.
-- Pengaturan jam pengiriman reminder per pengguna langsung dari bot.
-- Menu pengelolaan nomor (tambah, edit, hapus, cari, sortir).
-- Export ICS untuk sinkronisasi kalender.
-- Backup & restore database (khusus admin).
-- Tarik pembaruan bot langsung dari GitHub melalui menu admin di Telegram.
+- **Dashboard modern** – daftar nomor tampil rapi dengan status paket, indikator warna masa berlaku, dan ringkasan kuota utama.
+- **Pengingat kaya konten** – notifikasi H-1 dan Hari-H otomatis menampilkan seluruh paket yang akan habis dalam format terstruktur.
+- **Kelola nomor fleksibel** – tambah, cari, urut, edit, dan hapus nomor langsung dari inline menu Telegram.
+- **Sinkron kalender** – ekspor jadwal kedaluwarsa 30 hari ke depan dalam format `.ics` dengan UID stabil.
+- **Pemeliharaan otomatis** – refresh berkala, backup mingguan, restore instan, dan update aplikasi via GitHub cukup lewat tombol.
+- **Arsitektur modular** – kode dibagi ke paket `bot_paketxl/` (konfigurasi, storage, API client, tampilan, utilitas Telegram) sehingga mudah dikembangkan lagi.
+
+## Struktur kode
+
+```
+bot_paketxl/
+├── app.py             # kelas utama yang mendaftarkan handler & scheduler
+├── api.py             # klien HTTP untuk API pengecekan paket
+├── config.py          # pemetaan environment ke AppConfig
+├── formatting.py      # utilitas format teks & indikator masa berlaku
+├── storage.py         # abstraksi SQLite dan model domain
+├── telegram_utils.py  # helper chunking & pengiriman pesan aman
+└── views.py           # builder tampilan (overview, detail, reminder)
+
+xl_bot.py              # entry point bot
+bot_xlremainder.sh     # skrip instalasi & manajemen service
+```
+
+Pendekatan ini memudahkan penambahan fitur baru ataupun pengujian unit tanpa harus berurusan dengan satu skrip monolitik.
 
 ## Prasyarat
 
@@ -38,7 +54,7 @@ Bot Telegram untuk memantau paket data XL, masa aktif kartu, dan mengirimkan pen
    sudo ./bot_xlremainder.sh
    ```
 
-Skrip akan menyalin versi terbaru langsung dari GitHub ke `/opt/bot-xlreminder/app/`, membuat virtual environment di `/opt/bot-xlreminder/.venv/`, menyiapkan database, dan memasang service `systemd` bernama `bot-xlreminder`.
+Skrip akan meng-clone versi terbaru langsung dari GitHub ke `/opt/bot-xlreminder/app/`, membuat virtual environment di `/opt/bot-xlreminder/.venv/`, menyiapkan database, dan memasang service `systemd` bernama `bot-xlreminder`.
 
 ### Menu skrip instalasi
 
