@@ -217,6 +217,19 @@ async def query_edit_or_reply_chunks(query, text: str, reply_markup=None):
     for chunk in chunks[1:]:
         await message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
+
+async def bot_send_chunks(bot, chat_id: int, text: str, reply_markup=None):
+    chunks = chunk_text(text)
+    if not chunks:
+        return
+    first = True
+    for chunk in chunks:
+        if first:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            first = False
+        else:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
+
 # Prefs helpers
 def get_prefs(tg_user_id: int) -> Tuple[str, str]:
     con = _db_conn(); cur = con.cursor()
@@ -1365,7 +1378,7 @@ async def reminder_job(app: Application):
             ]
             text = "\n".join(lines)
             try:
-                await app.bot.send_message(chat_id=tg_user_id, text=text, parse_mode=ParseMode.HTML)
+                await bot_send_chunks(app.bot, tg_user_id, text)
                 set_last_notified(msisdn, expiry_text, notif_type)
                 logging.info(f"[Reminder] Sent {notif_type} for {msisdn} ({label}) exp {expiry_text}")
             except Exception as e:
